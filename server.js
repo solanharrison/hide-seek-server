@@ -4,268 +4,226 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 
 const app = express();
-
 app.use(cors({ origin: "*" }));
 
 app.get("/", (req, res) => {
-  res.send("Hide & Seek Server Running");
+  res.send("Shadow Hunt Server Running");
 });
 
 const server = http.createServer(app);
-
 const io = new Server(server, {
   cors: { origin: "*" }
 });
 
 const PORT = process.env.PORT || 10000;
-
 server.listen(PORT, "0.0.0.0", () => {
   console.log("Server running on port", PORT);
 });
 
-/* ================= GAME STATE ================= */
+/* ================= CONSTANTS ================= */
 
-let rooms = {};
+const GamePhase = {
+  LOBBY: "LOBBY",
+  HIDE: "HIDE",
+  HUNT: "HUNT",
+  RESULTS: "RESULTS"
+};
+
+const PlayerRole = {
+  KILLER: "KILLER",
+  HIDER: "HIDER",
+  SPECTATOR: "SPECTATOR"
+};
 
 const LOBBY_TIME = 20;
 const HIDE_TIME = 15;
 const HUNT_TIME = 60;
+const MIN_PLAYERS = 3;
 
-const KILL_DISTANCE = 120;
-const KILL_ANGLE = Math.PI / 6;
+/* ================= GAME STATE ================= */
+
+let gameState = {
+  players: {},
+  phase: GamePhase.LOBBY,
+  timer: 0,
+  winner: null
+};
+
+let interval = null;
 
 /* ================= SOCKET ================= */
 
 io.on("connection", (socket) => {
 
-  socket.on("joinRoom", (roomId) => {
-    socket.join(roomId);
+  socket.on("join", ({ name }) => {
+    gameState.players[socket.id] = {
+      id: socket.id,
+      name,
+      x: Math.random() * 1000 + 100,
+      y: Math.random() * 600 + 100,
+      angle: 0,
+      role: PlayerRole.SPECTATOR,
+      isDead: false
+    };
 
-    if (!rooms[roomId]) {
-      rooms[roomId] = createNewRoom();
-    }
+    broadcastState();
 
-    const room = rooms[roomId];
-
-    room.players[socket.id] = createPlayer();
-
-    io.to(roomId).emit("updatePlayers", room.players);
-
-    if (Object.keys(room.players).length >= 3 &&
-        room.state === "waiting") {
-      startLobby(roomId);
+    if (Object.keys(gameState.players).length >= MIN_PLAYERS &&
+        gameState.phase === GamePhase.LOBBY) {
+      startLobbyCountdown();
     }
   });
 
-  socket.on("move", ({ roomId, x, y, angle }) => {
-    const room = rooms[roomId];
-    if (!room) return;
+  socket.on("move", ({ x, y }) => {
+    const player = gameState.players[socket.id];
+    if (!player || player.isDead) return;
 
-    const player = room.players[socket.id];
-    if (!player || !player.alive) return;
+    // Basic boundary check
+    player.x = Math.max(20, Math.min(1180, x));
+    player.y = Math.max(20, Math.min(780, y));
 
-    player.x = x;
-    player.y = y;
+    broadcastState();
+  });
+
+  socket.on("rotate", ({ angle }) => {
+    const player = gameState.players[socket.id];
+    if (!player) return;
     player.angle = angle;
+  });
 
-    if (room.state === "hunt" && socket.id === room.killer) {
-      checkKills(roomId);
-    }
+  socket.on("attemptKill", ({ targetId }) => {
+    if (gameState.phase !== GamePhase.HUNT) return;
 
-    io.to(roomId).emit("updatePlayers", room.players);
+    const killer = gameState.players[socket.id];
+    const target = gameState.players[targetId];
+
+    if (!killer || !target) return;
+    if (killer.role !== PlayerRole.KILLER) return;
+    if (target.isDead) return;
+
+    // Server authoritative kill
+    target.isDead = true;
+
+    io.emit("killConfirmed", targetId);
+
+    checkWinCondition();
+    broadcastState();
   });
 
   socket.on("disconnect", () => {
-    for (let roomId in rooms) {
-      const room = rooms[roomId];
-      delete room.players[socket.id];
-
-      io.to(roomId).emit("updatePlayers", room.players);
-
-      // If no players left → delete room
-      if (Object.keys(room.players).length === 0) {
-        clearInterval(room.timer);
-        delete rooms[roomId];
-      }
-    }
+    delete gameState.players[socket.id];
+    broadcastState();
   });
 });
 
-/* ================= ROOM FACTORY ================= */
+/* ================= GAME FLOW ================= */
 
-function createNewRoom() {
-  return {
-    players: {},
-    state: "waiting",
-    killer: null,
-    timer: null,
-    timeLeft: 0
-  };
-}
+function startLobbyCountdown() {
+  gameState.phase = GamePhase.LOBBY;
+  gameState.timer = LOBBY_TIME;
+  broadcastState();
+  io.emit("phaseChange", GamePhase.LOBBY);
 
-function createPlayer() {
-  return {
-    x: Math.random() * 600,
-    y: Math.random() * 400,
-    angle: 0,
-    alive: true
-  };
-}
+  interval = setInterval(() => {
+    gameState.timer--;
+    broadcastState();
 
-/* ================= PHASE SYSTEM ================= */
-
-function startLobby(roomId) {
-  const room = rooms[roomId];
-  room.state = "lobby";
-  room.timeLeft = LOBBY_TIME;
-
-  io.to(roomId).emit("phase", { phase: "lobby", time: room.timeLeft });
-
-  room.timer = setInterval(() => {
-    room.timeLeft--;
-    io.to(roomId).emit("phase", { phase: "lobby", time: room.timeLeft });
-
-    if (room.timeLeft <= 0) {
-      clearInterval(room.timer);
-      startHide(roomId);
+    if (gameState.timer <= 0) {
+      clearInterval(interval);
+      startHidePhase();
     }
   }, 1000);
 }
 
-function startHide(roomId) {
-  const room = rooms[roomId];
+function startHidePhase() {
+  gameState.phase = GamePhase.HIDE;
+  gameState.timer = HIDE_TIME;
+  assignRoles();
+  broadcastState();
+  io.emit("phaseChange", GamePhase.HIDE);
 
-  const ids = Object.keys(room.players);
-  room.killer = ids[Math.floor(Math.random() * ids.length)];
+  interval = setInterval(() => {
+    gameState.timer--;
+    broadcastState();
 
-  room.state = "hide";
-  room.timeLeft = HIDE_TIME;
-
-  io.to(roomId).emit("role", room.killer);
-  io.to(roomId).emit("phase", { phase: "hide", time: room.timeLeft });
-
-  room.timer = setInterval(() => {
-    room.timeLeft--;
-    io.to(roomId).emit("phase", { phase: "hide", time: room.timeLeft });
-
-    if (room.timeLeft <= 0) {
-      clearInterval(room.timer);
-      startHunt(roomId);
+    if (gameState.timer <= 0) {
+      clearInterval(interval);
+      startHuntPhase();
     }
   }, 1000);
 }
 
-function startHunt(roomId) {
-  const room = rooms[roomId];
+function startHuntPhase() {
+  gameState.phase = GamePhase.HUNT;
+  gameState.timer = HUNT_TIME;
+  broadcastState();
+  io.emit("phaseChange", GamePhase.HUNT);
 
-  room.state = "hunt";
-  room.timeLeft = HUNT_TIME;
+  interval = setInterval(() => {
+    gameState.timer--;
+    broadcastState();
 
-  io.to(roomId).emit("phase", { phase: "hunt", time: room.timeLeft });
-
-  room.timer = setInterval(() => {
-    room.timeLeft--;
-    io.to(roomId).emit("phase", { phase: "hunt", time: room.timeLeft });
-
-    checkWin(roomId);
-
-    if (room.timeLeft <= 0) {
-      clearInterval(room.timer);
-      endGame(roomId);
+    if (gameState.timer <= 0) {
+      clearInterval(interval);
+      endGame("HIDER");
     }
   }, 1000);
 }
 
-/* ================= KILL SYSTEM ================= */
+function endGame(winner) {
+  gameState.phase = GamePhase.RESULTS;
+  gameState.winner = winner;
+  gameState.timer = 5;
+  broadcastState();
+  io.emit("phaseChange", GamePhase.RESULTS);
 
-function checkKills(roomId) {
-  const room = rooms[roomId];
-  const killer = room.players[room.killer];
-  if (!killer) return;
+  interval = setInterval(() => {
+    gameState.timer--;
+    broadcastState();
 
-  for (let id in room.players) {
-    if (id === room.killer) continue;
-
-    const player = room.players[id];
-    if (!player.alive) continue;
-
-    const dx = player.x - killer.x;
-    const dy = player.y - killer.y;
-
-    const distance = Math.sqrt(dx * dx + dy * dy);
-    if (distance > KILL_DISTANCE) continue;
-
-    const angleToPlayer = Math.atan2(dy, dx);
-    const angleDiff = normalize(angleToPlayer - killer.angle);
-
-    if (Math.abs(angleDiff) < KILL_ANGLE) {
-      player.alive = false;
-      io.to(roomId).emit("playerKilled", id);
+    if (gameState.timer <= 0) {
+      clearInterval(interval);
+      resetGame();
     }
-  }
+  }, 1000);
 }
 
-/* ================= WIN + RESET ================= */
+function assignRoles() {
+  const ids = Object.keys(gameState.players);
+  const killerIndex = Math.floor(Math.random() * ids.length);
 
-function checkWin(roomId) {
-  const room = rooms[roomId];
+  ids.forEach((id, index) => {
+    gameState.players[id].role =
+      index === killerIndex ? PlayerRole.KILLER : PlayerRole.HIDER;
+    gameState.players[id].isDead = false;
+  });
+}
 
-  if (room.state !== "hunt") return;
-
-  const aliveHiders = Object.keys(room.players)
-    .filter(id => id !== room.killer && room.players[id].alive);
+function checkWinCondition() {
+  const aliveHiders = Object.values(gameState.players)
+    .filter(p => p.role === PlayerRole.HIDER && !p.isDead);
 
   if (aliveHiders.length === 0) {
-    clearInterval(room.timer);
-    endGame(roomId);
+    clearInterval(interval);
+    endGame("KILLER");
   }
 }
 
-function endGame(roomId) {
-  const room = rooms[roomId];
+function resetGame() {
+  gameState.phase = GamePhase.LOBBY;
+  gameState.timer = 0;
+  gameState.winner = null;
 
-  const aliveHiders = Object.keys(room.players)
-    .filter(id => id !== room.killer && room.players[id].alive);
+  Object.values(gameState.players).forEach(p => {
+    p.role = PlayerRole.SPECTATOR;
+    p.isDead = false;
+  });
 
-  if (aliveHiders.length > 0) {
-    io.to(roomId).emit("winner", "survivors");
-  } else {
-    io.to(roomId).emit("winner", "killer");
-  }
-
-  room.state = "ended";
-
-  // Restart automatically after 5 seconds
-  setTimeout(() => {
-    resetRoom(roomId);
-  }, 5000);
-}
-
-function resetRoom(roomId) {
-  const room = rooms[roomId];
-  if (!room) return;
-
-  clearInterval(room.timer);
-
-  room.state = "waiting";
-  room.killer = null;
-  room.timeLeft = 0;
-
-  for (let id in room.players) {
-    room.players[id] = createPlayer();
-  }
-
-  io.to(roomId).emit("updatePlayers", room.players);
-
-  if (Object.keys(room.players).length >= 3) {
-    startLobby(roomId);
-  }
+  broadcastState();
 }
 
 /* ================= UTIL ================= */
 
-function normalize(a) {
-  while (a > Math.PI) a -= 2 * Math.PI;
-  while (a < -Math.PI) a += 2 * Math.PI;
-  return a;
+function broadcastState() {
+  io.emit("gameStateUpdate", gameState);
 }
