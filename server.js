@@ -5,12 +5,7 @@ const cors = require("cors");
 
 const app = express();
 
-// Allow Netlify
-const CLIENT_ORIGIN = "*";
-
-app.use(cors({
-  origin: CLIENT_ORIGIN
-}));
+app.use(cors({ origin: "*" }));
 
 app.get("/", (req, res) => {
   res.send("Hide & Seek Server Running");
@@ -19,9 +14,7 @@ app.get("/", (req, res) => {
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  cors: {
-    origin: CLIENT_ORIGIN
-  }
+  cors: { origin: "*" }
 });
 
 const PORT = process.env.PORT || 10000;
@@ -30,7 +23,7 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log("Server running on port", PORT);
 });
 
-/* ================= GAME LOGIC ================= */
+/* ================= GAME STATE ================= */
 
 let rooms = {};
 
@@ -41,32 +34,25 @@ const HUNT_TIME = 60;
 const KILL_DISTANCE = 120;
 const KILL_ANGLE = Math.PI / 6;
 
+/* ================= SOCKET ================= */
+
 io.on("connection", (socket) => {
 
   socket.on("joinRoom", (roomId) => {
     socket.join(roomId);
 
     if (!rooms[roomId]) {
-      rooms[roomId] = {
-        players: {},
-        state: "waiting",
-        killer: null,
-        timer: null,
-        timeLeft: 0
-      };
+      rooms[roomId] = createNewRoom();
     }
 
-    rooms[roomId].players[socket.id] = {
-      x: Math.random() * 600,
-      y: Math.random() * 400,
-      angle: 0,
-      alive: true
-    };
+    const room = rooms[roomId];
 
-    io.to(roomId).emit("updatePlayers", rooms[roomId].players);
+    room.players[socket.id] = createPlayer();
 
-    if (Object.keys(rooms[roomId].players).length >= 3 &&
-        rooms[roomId].state === "waiting") {
+    io.to(roomId).emit("updatePlayers", room.players);
+
+    if (Object.keys(room.players).length >= 3 &&
+        room.state === "waiting") {
       startLobby(roomId);
     }
   });
@@ -91,11 +77,40 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     for (let roomId in rooms) {
-      delete rooms[roomId].players[socket.id];
-      io.to(roomId).emit("updatePlayers", rooms[roomId].players);
+      const room = rooms[roomId];
+      delete room.players[socket.id];
+
+      io.to(roomId).emit("updatePlayers", room.players);
+
+      // If no players left → delete room
+      if (Object.keys(room.players).length === 0) {
+        clearInterval(room.timer);
+        delete rooms[roomId];
+      }
     }
   });
 });
+
+/* ================= ROOM FACTORY ================= */
+
+function createNewRoom() {
+  return {
+    players: {},
+    state: "waiting",
+    killer: null,
+    timer: null,
+    timeLeft: 0
+  };
+}
+
+function createPlayer() {
+  return {
+    x: Math.random() * 600,
+    y: Math.random() * 400,
+    angle: 0,
+    alive: true
+  };
+}
 
 /* ================= PHASE SYSTEM ================= */
 
@@ -119,9 +134,10 @@ function startLobby(roomId) {
 
 function startHide(roomId) {
   const room = rooms[roomId];
-  const ids = Object.keys(room.players);
 
+  const ids = Object.keys(room.players);
   room.killer = ids[Math.floor(Math.random() * ids.length)];
+
   room.state = "hide";
   room.timeLeft = HIDE_TIME;
 
@@ -141,6 +157,7 @@ function startHide(roomId) {
 
 function startHunt(roomId) {
   const room = rooms[roomId];
+
   room.state = "hunt";
   room.timeLeft = HUNT_TIME;
 
@@ -188,16 +205,19 @@ function checkKills(roomId) {
   }
 }
 
+/* ================= WIN + RESET ================= */
+
 function checkWin(roomId) {
   const room = rooms[roomId];
+
+  if (room.state !== "hunt") return;
 
   const aliveHiders = Object.keys(room.players)
     .filter(id => id !== room.killer && room.players[id].alive);
 
   if (aliveHiders.length === 0) {
-    io.to(roomId).emit("winner", "killer");
-    room.state = "ended";
     clearInterval(room.timer);
+    endGame(roomId);
   }
 }
 
@@ -214,7 +234,35 @@ function endGame(roomId) {
   }
 
   room.state = "ended";
+
+  // Restart automatically after 5 seconds
+  setTimeout(() => {
+    resetRoom(roomId);
+  }, 5000);
 }
+
+function resetRoom(roomId) {
+  const room = rooms[roomId];
+  if (!room) return;
+
+  clearInterval(room.timer);
+
+  room.state = "waiting";
+  room.killer = null;
+  room.timeLeft = 0;
+
+  for (let id in room.players) {
+    room.players[id] = createPlayer();
+  }
+
+  io.to(roomId).emit("updatePlayers", room.players);
+
+  if (Object.keys(room.players).length >= 3) {
+    startLobby(roomId);
+  }
+}
+
+/* ================= UTIL ================= */
 
 function normalize(a) {
   while (a > Math.PI) a -= 2 * Math.PI;
