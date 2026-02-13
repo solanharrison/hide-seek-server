@@ -5,11 +5,11 @@ const cors = require("cors");
 
 const app = express();
 
-const CLIENT_ORIGIN = "https://mellifluous-pegasus-8ca980.netlify.app";
+// Allow Netlify
+const CLIENT_ORIGIN = "*";
 
 app.use(cors({
-  origin: CLIENT_ORIGIN,
-  credentials: true
+  origin: CLIENT_ORIGIN
 }));
 
 app.get("/", (req, res) => {
@@ -20,13 +20,12 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: CLIENT_ORIGIN,
-    credentials: true
-  },
-  transports: ["websocket"]
+    origin: CLIENT_ORIGIN
+  }
 });
 
-const PORT = process.env.PORT;
+const PORT = process.env.PORT || 10000;
+
 server.listen(PORT, "0.0.0.0", () => {
   console.log("Server running on port", PORT);
 });
