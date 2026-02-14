@@ -6,7 +6,7 @@ const cors = require("cors");
 const app = express();
 app.use(cors({ origin: "*" }));
 
-app.get("/", (req, res) => {
+app.get("/", (_, res) => {
   res.send("Shadow Hunt Server Running");
 });
 
@@ -20,49 +20,54 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log("Server running on port", PORT);
 });
 
-/* ================= CONFIG ================= */
+/* ================= GAME CONFIG ================= */
+
+const PHASES = {
+  LOBBY: "lobby",
+  HIDE: "hide",
+  HUNT: "hunt",
+  RESULT: "result"
+};
 
 const MIN_PLAYERS = 3;
-const LOBBY_TIME = 20;
 const HIDE_TIME = 15;
 const HUNT_TIME = 60;
 
-/* ================= GAME STATE ================= */
+/* ================= STATE ================= */
 
 let players = {};
-let phase = "lobby";
+let phase = PHASES.LOBBY;
 let timer = 0;
-let lobbyInterval = null;
-let phaseInterval = null;
+let interval = null;
 
 /* ================= HELPERS ================= */
 
 function broadcastPlayers() {
-  // 🔥 FIX: send ARRAY, not object
   io.emit("updatePlayers", Object.values(players));
 }
 
-function startLobbyCountdown() {
-  if (lobbyInterval) return;
-
-  timer = LOBBY_TIME;
-  io.emit("lobbyCountdown", { seconds: timer });
-
-  lobbyInterval = setInterval(() => {
-    timer--;
-    io.emit("lobbyCountdown", { seconds: timer });
-
-    if (timer <= 0) {
-      clearInterval(lobbyInterval);
-      lobbyInterval = null;
-      startGame();
-    }
-  }, 1000);
+function broadcastPhase() {
+  io.emit("phaseChange", { phase, duration: timer });
 }
 
-function startGame() {
-  phase = "hide";
+function resetGame() {
+  phase = PHASES.LOBBY;
+  timer = 0;
 
+  Object.values(players).forEach(p => {
+    p.role = "hider";
+    p.isAlive = true;
+  });
+
+  broadcastPlayers();
+  broadcastPhase();
+}
+
+function startHidePhase() {
+  phase = PHASES.HIDE;
+  timer = HIDE_TIME;
+
+  // assign killer
   const ids = Object.keys(players);
   const killerId = ids[Math.floor(Math.random() * ids.length)];
 
@@ -71,58 +76,40 @@ function startGame() {
     players[id].isAlive = true;
   });
 
-  io.emit("gameStart", {
-    players: Object.values(players)
-  });
+  broadcastPlayers();
+  broadcastPhase();
 
-  ids.forEach(id => {
-    io.to(id).emit("roleAssigned", {
-      role: players[id].role
-    });
-  });
-
-  startPhaseTimer("hide", HIDE_TIME);
+  interval = setInterval(() => {
+    timer--;
+    broadcastPhase();
+    if (timer <= 0) {
+      clearInterval(interval);
+      startHuntPhase();
+    }
+  }, 1000);
 }
 
-function startPhaseTimer(newPhase, duration) {
-  phase = newPhase;
-  timer = duration;
+function startHuntPhase() {
+  phase = PHASES.HUNT;
+  timer = HUNT_TIME;
+  broadcastPhase();
 
-  io.emit("phaseChange", {
-    phase,
-    duration
-  });
-
-  if (phaseInterval) clearInterval(phaseInterval);
-
-  phaseInterval = setInterval(() => {
+  interval = setInterval(() => {
     timer--;
+    broadcastPhase();
 
     if (timer <= 0) {
-      clearInterval(phaseInterval);
-
-      if (phase === "hide") {
-        startPhaseTimer("hunt", HUNT_TIME);
-      } else if (phase === "hunt") {
-        endGame("hiders");
-      }
+      clearInterval(interval);
+      endGame("hiders");
     }
   }, 1000);
 }
 
 function endGame(winner) {
-  phase = "result";
+  phase = PHASES.RESULT;
   io.emit("gameEnd", { winner });
-  setTimeout(resetGame, 5000);
-}
 
-function resetGame() {
-  phase = "lobby";
-  Object.values(players).forEach(p => {
-    p.role = "hider";
-    p.isAlive = true;
-  });
-  io.emit("gameReset");
+  setTimeout(resetGame, 5000);
 }
 
 /* ================= SOCKET ================= */
@@ -146,12 +133,13 @@ io.on("connection", socket => {
       players: Object.values(players)
     });
 
-    io.emit("playerJoined", {
-      players: Object.values(players)
-    });
+    broadcastPlayers();
 
-    if (Object.keys(players).length >= MIN_PLAYERS && phase === "lobby") {
-      startLobbyCountdown();
+    if (
+      Object.keys(players).length >= MIN_PLAYERS &&
+      phase === PHASES.LOBBY
+    ) {
+      startHidePhase();
     }
   });
 
@@ -159,21 +147,15 @@ io.on("connection", socket => {
     const p = players[socket.id];
     if (!p || !p.isAlive) return;
 
-    p.x = Math.max(20, Math.min(1200, x));
-    p.y = Math.max(20, Math.min(800, y));
+    p.x = x;
+    p.y = y;
     p.angle = angle;
 
     broadcastPlayers();
   });
 
-  socket.on("angle", ({ angle }) => {
-    const p = players[socket.id];
-    if (!p) return;
-    p.angle = angle;
-  });
-
   socket.on("attemptKill", ({ targetId }) => {
-    if (phase !== "hunt") return;
+    if (phase !== PHASES.HUNT) return;
 
     const killer = players[socket.id];
     const target = players[targetId];
@@ -183,26 +165,22 @@ io.on("connection", socket => {
     if (!target.isAlive) return;
 
     target.isAlive = false;
+    io.emit("playerKilled", { playerId: targetId });
 
-    io.emit("playerKilled", {
-      playerId: targetId,
-      killerId: socket.id
-    });
-
-    broadcastPlayers();
-
-    const aliveHiders = Object.values(players)
-      .filter(p => p.role === "hider" && p.isAlive);
+    const aliveHiders = Object.values(players).filter(
+      p => p.role === "hider" && p.isAlive
+    );
 
     if (aliveHiders.length === 0) {
+      clearInterval(interval);
       endGame("killer");
     }
+
+    broadcastPlayers();
   });
 
   socket.on("disconnect", () => {
     delete players[socket.id];
-    io.emit("playerLeft", {
-      players: Object.values(players)
-    });
+    broadcastPlayers();
   });
 });
