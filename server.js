@@ -20,210 +20,209 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log("Server running on port", PORT);
 });
 
-/* ================= CONSTANTS ================= */
+/* ================= CONFIG ================= */
 
-const GamePhase = {
-  LOBBY: "LOBBY",
-  HIDE: "HIDE",
-  HUNT: "HUNT",
-  RESULTS: "RESULTS"
-};
-
-const PlayerRole = {
-  KILLER: "KILLER",
-  HIDER: "HIDER",
-  SPECTATOR: "SPECTATOR"
-};
-
+const MIN_PLAYERS = 3;
 const LOBBY_TIME = 20;
 const HIDE_TIME = 15;
 const HUNT_TIME = 60;
-const MIN_PLAYERS = 3;
 
 /* ================= GAME STATE ================= */
 
-let gameState = {
-  players: {},
-  phase: GamePhase.LOBBY,
-  timer: 0,
-  winner: null
-};
+let players = {}; // socket.id -> player
+let phase = "lobby"; // lobby | hide | hunt | result
+let timer = 0;
+let lobbyInterval = null;
+let phaseInterval = null;
+let killerId = null;
 
-let interval = null;
+/* ================= HELPERS ================= */
 
-/* ================= SOCKET ================= */
-
-io.on("connection", (socket) => {
-
-  socket.on("join", ({ name }) => {
-    gameState.players[socket.id] = {
-      id: socket.id,
-      name,
-      x: Math.random() * 1000 + 100,
-      y: Math.random() * 600 + 100,
-      angle: 0,
-      role: PlayerRole.SPECTATOR,
-      isDead: false
-    };
-
-    broadcastState();
-
-    if (Object.keys(gameState.players).length >= MIN_PLAYERS &&
-        gameState.phase === GamePhase.LOBBY) {
-      startLobbyCountdown();
-    }
+function broadcastPlayers() {
+  io.emit("updatePlayers", {
+    players: Object.values(players)
   });
+}
 
-  socket.on("move", ({ x, y }) => {
-    const player = gameState.players[socket.id];
-    if (!player || player.isDead) return;
-
-    // Basic boundary check
-    player.x = Math.max(20, Math.min(1180, x));
-    player.y = Math.max(20, Math.min(780, y));
-
-    broadcastState();
+function broadcastLobby() {
+  io.emit("playerJoined", {
+    players: Object.values(players)
   });
-
-  socket.on("rotate", ({ angle }) => {
-    const player = gameState.players[socket.id];
-    if (!player) return;
-    player.angle = angle;
-  });
-
-  socket.on("attemptKill", ({ targetId }) => {
-    if (gameState.phase !== GamePhase.HUNT) return;
-
-    const killer = gameState.players[socket.id];
-    const target = gameState.players[targetId];
-
-    if (!killer || !target) return;
-    if (killer.role !== PlayerRole.KILLER) return;
-    if (target.isDead) return;
-
-    // Server authoritative kill
-    target.isDead = true;
-
-    io.emit("killConfirmed", targetId);
-
-    checkWinCondition();
-    broadcastState();
-  });
-
-  socket.on("disconnect", () => {
-    delete gameState.players[socket.id];
-    broadcastState();
-  });
-});
-
-/* ================= GAME FLOW ================= */
+}
 
 function startLobbyCountdown() {
-  gameState.phase = GamePhase.LOBBY;
-  gameState.timer = LOBBY_TIME;
-  broadcastState();
-  io.emit("phaseChange", GamePhase.LOBBY);
+  if (lobbyInterval) return;
 
-  interval = setInterval(() => {
-    gameState.timer--;
-    broadcastState();
+  timer = LOBBY_TIME;
+  io.emit("lobbyCountdown", { seconds: timer });
 
-    if (gameState.timer <= 0) {
-      clearInterval(interval);
-      startHidePhase();
+  lobbyInterval = setInterval(() => {
+    timer--;
+    io.emit("lobbyCountdown", { seconds: timer });
+
+    if (timer <= 0) {
+      clearInterval(lobbyInterval);
+      lobbyInterval = null;
+      startGame();
     }
   }, 1000);
 }
 
-function startHidePhase() {
-  gameState.phase = GamePhase.HIDE;
-  gameState.timer = HIDE_TIME;
-  assignRoles();
-  broadcastState();
-  io.emit("phaseChange", GamePhase.HIDE);
+function startGame() {
+  phase = "hide";
 
-  interval = setInterval(() => {
-    gameState.timer--;
-    broadcastState();
+  const ids = Object.keys(players);
+  killerId = ids[Math.floor(Math.random() * ids.length)];
 
-    if (gameState.timer <= 0) {
-      clearInterval(interval);
-      startHuntPhase();
-    }
-  }, 1000);
+  ids.forEach(id => {
+    players[id].role = id === killerId ? "killer" : "hider";
+    players[id].isAlive = true;
+  });
+
+  io.emit("gameStart", {
+    players: Object.values(players)
+  });
+
+  ids.forEach(id => {
+    io.to(id).emit("roleAssigned", {
+      role: players[id].role
+    });
+  });
+
+  startPhaseTimer("hide", HIDE_TIME);
 }
 
-function startHuntPhase() {
-  gameState.phase = GamePhase.HUNT;
-  gameState.timer = HUNT_TIME;
-  broadcastState();
-  io.emit("phaseChange", GamePhase.HUNT);
+function startPhaseTimer(newPhase, duration) {
+  phase = newPhase;
+  timer = duration;
 
-  interval = setInterval(() => {
-    gameState.timer--;
-    broadcastState();
+  io.emit("phaseChange", {
+    phase,
+    duration
+  });
 
-    if (gameState.timer <= 0) {
-      clearInterval(interval);
-      endGame("HIDER");
+  if (phaseInterval) clearInterval(phaseInterval);
+
+  phaseInterval = setInterval(() => {
+    timer--;
+
+    if (timer <= 0) {
+      clearInterval(phaseInterval);
+
+      if (phase === "hide") {
+        startPhaseTimer("hunt", HUNT_TIME);
+      } else if (phase === "hunt") {
+        endGame("hiders");
+      }
     }
   }, 1000);
 }
 
 function endGame(winner) {
-  gameState.phase = GamePhase.RESULTS;
-  gameState.winner = winner;
-  gameState.timer = 5;
-  broadcastState();
-  io.emit("phaseChange", GamePhase.RESULTS);
+  phase = "result";
 
-  interval = setInterval(() => {
-    gameState.timer--;
-    broadcastState();
-
-    if (gameState.timer <= 0) {
-      clearInterval(interval);
-      resetGame();
-    }
-  }, 1000);
-}
-
-function assignRoles() {
-  const ids = Object.keys(gameState.players);
-  const killerIndex = Math.floor(Math.random() * ids.length);
-
-  ids.forEach((id, index) => {
-    gameState.players[id].role =
-      index === killerIndex ? PlayerRole.KILLER : PlayerRole.HIDER;
-    gameState.players[id].isDead = false;
+  io.emit("gameEnd", {
+    winner
   });
-}
 
-function checkWinCondition() {
-  const aliveHiders = Object.values(gameState.players)
-    .filter(p => p.role === PlayerRole.HIDER && !p.isDead);
-
-  if (aliveHiders.length === 0) {
-    clearInterval(interval);
-    endGame("KILLER");
-  }
+  setTimeout(resetGame, 5000);
 }
 
 function resetGame() {
-  gameState.phase = GamePhase.LOBBY;
-  gameState.timer = 0;
-  gameState.winner = null;
+  phase = "lobby";
+  killerId = null;
 
-  Object.values(gameState.players).forEach(p => {
-    p.role = PlayerRole.SPECTATOR;
-    p.isDead = false;
+  Object.values(players).forEach(p => {
+    p.role = "hider";
+    p.isAlive = true;
   });
 
-  broadcastState();
+  io.emit("gameReset");
 }
 
-/* ================= UTIL ================= */
+/* ================= SOCKET ================= */
 
-function broadcastState() {
-  io.emit("gameStateUpdate", gameState);
-}
+io.on("connection", socket => {
+
+  /* ===== JOIN ===== */
+  socket.on("joinRoom", ({ name }) => {
+    players[socket.id] = {
+      id: socket.id,
+      name,
+      x: Math.random() * 600 + 100,
+      y: Math.random() * 400 + 100,
+      angle: 0,
+      role: "hider",
+      isAlive: true
+    };
+
+    socket.emit("joined", {
+      id: socket.id,
+      name,
+      players: Object.values(players)
+    });
+
+    broadcastLobby();
+
+    if (Object.keys(players).length >= MIN_PLAYERS && phase === "lobby") {
+      startLobbyCountdown();
+    }
+  });
+
+  /* ===== MOVE ===== */
+  socket.on("move", ({ x, y, angle }) => {
+    const p = players[socket.id];
+    if (!p || !p.isAlive) return;
+
+    // simple bounds
+    p.x = Math.max(20, Math.min(1200, x));
+    p.y = Math.max(20, Math.min(800, y));
+    p.angle = angle;
+
+    broadcastPlayers();
+  });
+
+  /* ===== ROTATION (MOUSE / TOUCH) ===== */
+  socket.on("angle", ({ angle }) => {
+    const p = players[socket.id];
+    if (!p) return;
+    p.angle = angle;
+  });
+
+  /* ===== KILL ===== */
+  socket.on("attemptKill", ({ targetId }) => {
+    if (phase !== "hunt") return;
+
+    const killer = players[socket.id];
+    const target = players[targetId];
+
+    if (!killer || !target) return;
+    if (killer.role !== "killer") return;
+    if (!target.isAlive) return;
+
+    target.isAlive = false;
+
+    io.emit("playerKilled", {
+      playerId: targetId,
+      killerId: socket.id
+    });
+
+    broadcastPlayers();
+
+    const aliveHiders = Object.values(players)
+      .filter(p => p.role === "hider" && p.isAlive);
+
+    if (aliveHiders.length === 0) {
+      endGame("killer");
+    }
+  });
+
+  /* ===== DISCONNECT ===== */
+  socket.on("disconnect", () => {
+    delete players[socket.id];
+
+    io.emit("playerLeft", {
+      players: Object.values(players)
+    });
+  });
+});
