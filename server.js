@@ -29,25 +29,17 @@ const HUNT_TIME = 60;
 
 /* ================= GAME STATE ================= */
 
-let players = {}; // socket.id -> player
-let phase = "lobby"; // lobby | hide | hunt | result
+let players = {};
+let phase = "lobby";
 let timer = 0;
 let lobbyInterval = null;
 let phaseInterval = null;
-let killerId = null;
 
 /* ================= HELPERS ================= */
 
 function broadcastPlayers() {
-  io.emit("updatePlayers", {
-    players: Object.values(players)
-  });
-}
-
-function broadcastLobby() {
-  io.emit("playerJoined", {
-    players: Object.values(players)
-  });
+  // 🔥 FIX: send ARRAY, not object
+  io.emit("updatePlayers", Object.values(players));
 }
 
 function startLobbyCountdown() {
@@ -72,7 +64,7 @@ function startGame() {
   phase = "hide";
 
   const ids = Object.keys(players);
-  killerId = ids[Math.floor(Math.random() * ids.length)];
+  const killerId = ids[Math.floor(Math.random() * ids.length)];
 
   ids.forEach(id => {
     players[id].role = id === killerId ? "killer" : "hider";
@@ -120,23 +112,16 @@ function startPhaseTimer(newPhase, duration) {
 
 function endGame(winner) {
   phase = "result";
-
-  io.emit("gameEnd", {
-    winner
-  });
-
+  io.emit("gameEnd", { winner });
   setTimeout(resetGame, 5000);
 }
 
 function resetGame() {
   phase = "lobby";
-  killerId = null;
-
   Object.values(players).forEach(p => {
     p.role = "hider";
     p.isAlive = true;
   });
-
   io.emit("gameReset");
 }
 
@@ -144,7 +129,6 @@ function resetGame() {
 
 io.on("connection", socket => {
 
-  /* ===== JOIN ===== */
   socket.on("joinRoom", ({ name }) => {
     players[socket.id] = {
       id: socket.id,
@@ -162,19 +146,19 @@ io.on("connection", socket => {
       players: Object.values(players)
     });
 
-    broadcastLobby();
+    io.emit("playerJoined", {
+      players: Object.values(players)
+    });
 
     if (Object.keys(players).length >= MIN_PLAYERS && phase === "lobby") {
       startLobbyCountdown();
     }
   });
 
-  /* ===== MOVE ===== */
   socket.on("move", ({ x, y, angle }) => {
     const p = players[socket.id];
     if (!p || !p.isAlive) return;
 
-    // simple bounds
     p.x = Math.max(20, Math.min(1200, x));
     p.y = Math.max(20, Math.min(800, y));
     p.angle = angle;
@@ -182,14 +166,12 @@ io.on("connection", socket => {
     broadcastPlayers();
   });
 
-  /* ===== ROTATION (MOUSE / TOUCH) ===== */
   socket.on("angle", ({ angle }) => {
     const p = players[socket.id];
     if (!p) return;
     p.angle = angle;
   });
 
-  /* ===== KILL ===== */
   socket.on("attemptKill", ({ targetId }) => {
     if (phase !== "hunt") return;
 
@@ -217,10 +199,8 @@ io.on("connection", socket => {
     }
   });
 
-  /* ===== DISCONNECT ===== */
   socket.on("disconnect", () => {
     delete players[socket.id];
-
     io.emit("playerLeft", {
       players: Object.values(players)
     });
